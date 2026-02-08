@@ -705,3 +705,33 @@ async def dataset_export(admin_key: str = Query(...)):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "strava_configured": bool(STRAVA_CLIENT_ID)}
+
+
+@app.post("/api/admin/migrate")
+async def run_migrations(admin_key: str = Query(...)):
+    """Run database migrations to add new columns to existing tables."""
+    expected = os.environ.get("ADMIN_KEY", "")
+    if not expected or admin_key != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    from database import pool
+    if not pool:
+        raise HTTPException(status_code=500, detail="Database not connected")
+
+    migrations = [
+        "ALTER TABLE race_results ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'manual'",
+        "ALTER TABLE pending_predictions ADD COLUMN IF NOT EXISTS goal_race_name TEXT",
+        "ALTER TABLE pending_predictions ADD COLUMN IF NOT EXISTS goal_race_date DATE",
+        "ALTER TABLE pending_predictions ADD COLUMN IF NOT EXISTS match_window_days INT DEFAULT 3",
+    ]
+
+    results = []
+    async with pool.acquire() as conn:
+        for sql in migrations:
+            try:
+                await conn.execute(sql)
+                results.append({"sql": sql, "status": "ok"})
+            except Exception as e:
+                results.append({"sql": sql, "status": "error", "detail": str(e)})
+
+    return {"migrations": results}
