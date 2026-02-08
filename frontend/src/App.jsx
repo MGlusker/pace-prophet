@@ -35,7 +35,7 @@ export default function App() {
   const [loadingMsg, setLoadingMsg] = useState('');
 
   // Form state
-  const [mode, setMode] = useState('manual'); // 'strava' | 'manual'
+  const [mode, setMode] = useState('manual');
   const [raceDistIdx, setRaceDistIdx] = useState(1);
   const [goalDistIdx, setGoalDistIdx] = useState(5);
   const [hours, setHours] = useState('0');
@@ -50,6 +50,19 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [showSplits, setShowSplits] = useState(false);
   const [splitUnit, setSplitUnit] = useState('mile');
+
+  // Data collection state
+  const [dataConsent, setDataConsent] = useState(null); // null = unknown, true/false
+  const [showConsentBanner, setShowConsentBanner] = useState(false);
+  const [consentDismissed, setConsentDismissed] = useState(false);
+  const [snapshotId, setSnapshotId] = useState(null);
+  const [contributionStatus, setContributionStatus] = useState(null); // 'saved' | 'error'
+  const [dataStats, setDataStats] = useState(null);
+
+  // Race result detection
+  const [detectedRace, setDetectedRace] = useState(null);
+  const [showRacePrompt, setShowRacePrompt] = useState(false);
+  const [raceSubmitted, setRaceSubmitted] = useState(false);
 
   // Check for existing Strava session on mount
   useEffect(() => {
@@ -67,36 +80,42 @@ export default function App() {
         }
       });
     }
+    // Load dataset stats
+    apiGet('/api/data/stats').then(setDataStats).catch(() => {});
   }, []);
 
-  // Load Strava data when we have a token
+  // Load Strava data + check consent when we have a token
   useEffect(() => {
-    if (!accessToken) return;
+    if (!accessToken || !stravaUser) return;
     setLoading(true);
     setLoadingMsg('Fetching your runs from Strava...');
 
     Promise.all([
       apiGet('/api/strava/athlete', { access_token: accessToken }),
       apiGet('/api/strava/activities', { access_token: accessToken, weeks: 16 }),
+      apiGet('/api/data/consent', { athlete_id: stravaUser.id }),
     ])
-      .then(([athlete, activities]) => {
+      .then(([athlete, activities, consent]) => {
         setStravaData({ athlete, activities });
-        // Auto-fill fields
+        setDataConsent(consent.opted_in);
+
+        // Show consent banner if not yet decided
+        if (!consent.opted_in && !consentDismissed) {
+          setShowConsentBanner(true);
+        }
+
         if (athlete.age) setAge(String(athlete.age));
         if (activities.avg_weekly_miles) setWeeklyMiles(String(activities.avg_weekly_miles));
 
-        // Auto-select best effort if available
         const efforts = activities.best_efforts || {};
         const preferredOrder = ['Half Marathon', '10K', '5K', '1 Mile'];
         for (const dist of preferredOrder) {
           if (efforts[dist]) {
             setSelectedStravaRace(efforts[dist]);
-            // Find matching distance index
             const idx = DISTANCES.findIndex(
               (d) => Math.abs(d.km - efforts[dist].distance_km) < 0.5
             );
             if (idx >= 0) setRaceDistIdx(idx);
-            // Parse time
             const ts = efforts[dist].time_seconds;
             setHours(String(Math.floor(ts / 3600)));
             setMinutes(String(Math.floor((ts % 3600) / 60)));
@@ -109,9 +128,8 @@ export default function App() {
       .catch((err) => {
         console.error('Strava load error:', err);
         setLoading(false);
-        setLoadingMsg('');
       });
-  }, [accessToken]);
+  }, [accessToken, stravaUser]);
 
   const connectStrava = async () => {
     try {
@@ -129,6 +147,8 @@ export default function App() {
     setStravaData(null);
     setMode('manual');
     setSelectedStravaRace(null);
+    setDataConsent(null);
+    setShowConsentBanner(false);
   };
 
   const selectStravaEffort = (label, effort) => {
@@ -141,6 +161,47 @@ export default function App() {
     setSeconds(String(ts % 60).padStart(2, '0'));
   };
 
+  // --- Consent handlers ---
+  const handleOptIn = async () => {
+    if (!stravaUser) return;
+    try {
+      await apiPost('/api/data/consent', { athlete_id: stravaUser.id, opted_in: true });
+      setDataConsent(true);
+      setShowConsentBanner(false);
+    } catch (err) {
+      console.error('Consent error:', err);
+    }
+  };
+
+  const handleOptOut = async () => {
+    if (!stravaUser) return;
+    try {
+      await apiPost('/api/data/consent', { athlete_id: stravaUser.id, opted_in: false });
+      setDataConsent(false);
+      setShowConsentBanner(false);
+      setConsentDismissed(true);
+    } catch (err) {
+      console.error('Consent error:', err);
+    }
+  };
+
+  const handleDeleteData = async () => {
+    if (!stravaUser) return;
+    if (!confirm('This will permanently delete all your contributed data. Continue?')) return;
+    try {
+      await apiPost('/api/data/consent', { athlete_id: stravaUser.id, opted_in: false });
+      // Use fetch directly for DELETE
+      const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      await fetch(`${API_BASE}/api/data/my-data?athlete_id=${stravaUser.id}`, { method: 'DELETE' });
+      setDataConsent(false);
+      setSnapshotId(null);
+      alert('Your data has been deleted.');
+    } catch (err) {
+      console.error('Delete error:', err);
+    }
+  };
+
+  // --- Prediction with optional data contribution ---
   const calculate = useCallback(async () => {
     const timeSec =
       (parseInt(hours) || 0) * 3600 + (parseInt(minutes) || 0) * 60 + (parseInt(seconds) || 0);
@@ -157,10 +218,91 @@ export default function App() {
       });
       setResult(prediction);
       setShowSplits(false);
+      setContributionStatus(null);
+      setDetectedRace(null);
+      setShowRacePrompt(false);
+      setRaceSubmitted(false);
+
+      // Auto-contribute if opted in and connected to Strava
+      if (dataConsent && stravaUser && accessToken) {
+        try {
+          const contrib = await apiPost('/api/data/contribute', {
+            athlete_id: stravaUser.id,
+            access_token: accessToken,
+            ref_distance_km: DISTANCES[raceDistIdx].km,
+            ref_time_seconds: timeSec,
+            ref_date: selectedStravaRace?.date || null,
+            goal_distance_km: DISTANCES[goalDistIdx].km,
+            predicted_time_seconds: prediction.predicted_seconds,
+            age: parseInt(age) || null,
+            experience,
+            gender: stravaData?.athlete?.sex || null,
+          });
+          setSnapshotId(contrib.snapshot_id);
+          setContributionStatus('saved');
+        } catch (err) {
+          console.error('Contribution error:', err);
+          setContributionStatus('error');
+        }
+      }
     } catch (err) {
       alert('Prediction failed: ' + err.message);
     }
-  }, [hours, minutes, seconds, raceDistIdx, goalDistIdx, weeklyMiles, age, experience]);
+  }, [hours, minutes, seconds, raceDistIdx, goalDistIdx, weeklyMiles, age, experience, dataConsent, stravaUser, accessToken, selectedStravaRace, stravaData]);
+
+  // --- Check for completed race ---
+  const checkForRace = useCallback(async () => {
+    if (!accessToken || !result) return;
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      // Check for races in the last 30 days
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+        .toISOString().split('T')[0];
+      const resp = await apiGet('/api/data/check-race', {
+        access_token: accessToken,
+        goal_distance_km: DISTANCES[goalDistIdx].km,
+        after_date: thirtyDaysAgo,
+      });
+      if (resp.matches && resp.matches.length > 0) {
+        setDetectedRace(resp.matches[0]);
+        setShowRacePrompt(true);
+      }
+    } catch (err) {
+      console.error('Race check error:', err);
+    }
+  }, [accessToken, result, goalDistIdx]);
+
+  // Auto-check for race results after prediction
+  useEffect(() => {
+    if (result && accessToken && dataConsent) {
+      checkForRace();
+    }
+  }, [result, accessToken, dataConsent, checkForRace]);
+
+  const submitRaceResult = async () => {
+    if (!detectedRace || !stravaUser || !result) return;
+    const timeSec =
+      (parseInt(hours) || 0) * 3600 + (parseInt(minutes) || 0) * 60 + (parseInt(seconds) || 0);
+    try {
+      await apiPost('/api/data/race-result', {
+        athlete_id: stravaUser.id,
+        access_token: accessToken,
+        snapshot_id: snapshotId,
+        ref_distance_km: DISTANCES[raceDistIdx].km,
+        ref_time_seconds: timeSec,
+        ref_date: selectedStravaRace?.date || null,
+        goal_distance_km: detectedRace.distance_km,
+        goal_time_seconds: detectedRace.time_seconds,
+        goal_date: detectedRace.date,
+        goal_elevation_gain_ft: detectedRace.elevation_gain_ft,
+        predicted_time_seconds: result.predicted_seconds,
+      });
+      setRaceSubmitted(true);
+      setShowRacePrompt(false);
+    } catch (err) {
+      console.error('Race result submit error:', err);
+    }
+  };
 
   const generateSplits = (totalSeconds, distKm, unit = 'mile') => {
     const splitDist = unit === 'mile' ? 1.60934 : 1;
@@ -197,6 +339,29 @@ export default function App() {
           <p className="subtitle">Predict your finish time with precision</p>
         </header>
 
+        {/* Consent Banner */}
+        {showConsentBanner && stravaUser && (
+          <div className="consent-banner">
+            <div className="consent-icon">📊</div>
+            <div className="consent-content">
+              <div className="consent-title">Help improve predictions for everyone</div>
+              <div className="consent-text">
+                Contribute your anonymized training and race data to make our prediction model
+                more accurate. No personal info is stored — only aggregate training stats
+                like weekly mileage, pace, and race times.
+              </div>
+              <div className="consent-actions">
+                <button onClick={handleOptIn} className="btn-consent-yes">
+                  Yes, contribute my data
+                </button>
+                <button onClick={handleOptOut} className="btn-consent-no">
+                  No thanks
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Strava Connection Bar */}
         <div className="strava-bar">
           {stravaUser ? (
@@ -209,12 +374,27 @@ export default function App() {
                   <div className="strava-name">
                     {stravaUser.firstname} {stravaUser.lastname}
                   </div>
-                  <div className="strava-status">Connected to Strava</div>
+                  <div className="strava-status">
+                    Connected to Strava
+                    {dataConsent && <span className="consent-badge"> · Contributing data</span>}
+                  </div>
                 </div>
               </div>
-              <button onClick={disconnectStrava} className="btn-disconnect">
-                Disconnect
-              </button>
+              <div className="strava-actions">
+                {dataConsent && (
+                  <button onClick={handleDeleteData} className="btn-delete-data" title="Delete my data">
+                    🗑
+                  </button>
+                )}
+                {dataConsent === false && !consentDismissed && (
+                  <button onClick={() => setShowConsentBanner(true)} className="btn-disconnect" style={{marginRight: 8}}>
+                    Opt in
+                  </button>
+                )}
+                <button onClick={disconnectStrava} className="btn-disconnect">
+                  Disconnect
+                </button>
+              </div>
             </div>
           ) : (
             <button onClick={connectStrava} className="btn-strava">
@@ -255,7 +435,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Best efforts picker */}
             {Object.keys(stravaData.activities.best_efforts).length > 0 && (
               <div className="efforts-section">
                 <div className="label">Select a recent effort as your baseline:</div>
@@ -278,7 +457,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Recent races */}
             {stravaData.activities.races.length > 0 && (
               <div className="efforts-section">
                 <div className="label">Strava-tagged races:</div>
@@ -335,38 +513,20 @@ export default function App() {
             <label className="label">Finish Time</label>
             <div className="time-row">
               <div className="time-group">
-                <input
-                  type="number"
-                  min="0"
-                  max="23"
-                  value={hours}
-                  onChange={(e) => setHours(e.target.value)}
-                  className="time-input"
-                />
+                <input type="number" min="0" max="23" value={hours}
+                  onChange={(e) => setHours(e.target.value)} className="time-input" />
                 <span className="time-label">hr</span>
               </div>
               <span className="time-sep">:</span>
               <div className="time-group">
-                <input
-                  type="number"
-                  min="0"
-                  max="59"
-                  value={minutes}
-                  onChange={(e) => setMinutes(e.target.value)}
-                  className="time-input"
-                />
+                <input type="number" min="0" max="59" value={minutes}
+                  onChange={(e) => setMinutes(e.target.value)} className="time-input" />
                 <span className="time-label">min</span>
               </div>
               <span className="time-sep">:</span>
               <div className="time-group">
-                <input
-                  type="number"
-                  min="0"
-                  max="59"
-                  value={seconds}
-                  onChange={(e) => setSeconds(e.target.value)}
-                  className="time-input"
-                />
+                <input type="number" min="0" max="59" value={seconds}
+                  onChange={(e) => setSeconds(e.target.value)} className="time-input" />
                 <span className="time-label">sec</span>
               </div>
             </div>
@@ -396,29 +556,19 @@ export default function App() {
           <div className="row">
             <div className="field">
               <label className="label">Weekly Mileage</label>
-              <input
-                type="number"
-                value={weeklyMiles}
+              <input type="number" value={weeklyMiles}
                 onChange={(e) => setWeeklyMiles(e.target.value)}
-                className="input"
-                placeholder="e.g. 35"
-              />
+                className="input" placeholder="e.g. 35" />
               <span className="hint">
                 {stravaData ? 'Auto-filled from Strava' : 'miles/week average'}
               </span>
             </div>
             <div className="field">
               <label className="label">Age</label>
-              <input
-                type="number"
-                value={age}
+              <input type="number" value={age}
                 onChange={(e) => setAge(e.target.value)}
-                className="input"
-                placeholder="e.g. 30"
-              />
-              {stravaData?.athlete?.age && (
-                <span className="hint">From Strava profile</span>
-              )}
+                className="input" placeholder="e.g. 30" />
+              {stravaData?.athlete?.age && <span className="hint">From Strava profile</span>}
             </div>
           </div>
 
@@ -469,6 +619,45 @@ export default function App() {
               </div>
             </div>
 
+            {/* Contribution status */}
+            {contributionStatus === 'saved' && (
+              <div className="contribution-badge">
+                ✓ Training data saved — we'll compare against your actual race to improve predictions
+              </div>
+            )}
+
+            {/* Detected race result prompt */}
+            {showRacePrompt && detectedRace && !raceSubmitted && (
+              <div className="race-prompt">
+                <div className="race-prompt-title">🏁 Did you run this race?</div>
+                <div className="race-prompt-detail">
+                  <strong>{detectedRace.name}</strong> on {detectedRace.date}
+                  <br />
+                  {formatTime(detectedRace.time_seconds)} ({detectedRace.distance_km.toFixed(1)} km)
+                  {detectedRace.is_race && <span className="race-tag">RACE</span>}
+                </div>
+                <div className="race-prompt-comparison">
+                  Predicted: {result.predicted_formatted} → Actual: {formatTime(detectedRace.time_seconds)}
+                  {' '}({detectedRace.time_seconds < result.predicted_seconds ? 'faster' : 'slower'} by{' '}
+                  {formatTime(Math.abs(result.predicted_seconds - detectedRace.time_seconds))})
+                </div>
+                <div className="race-prompt-actions">
+                  <button onClick={submitRaceResult} className="btn-submit-race">
+                    Yes, save this result
+                  </button>
+                  <button onClick={() => setShowRacePrompt(false)} className="btn-dismiss-race">
+                    Not my race
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {raceSubmitted && (
+              <div className="contribution-badge">
+                ✓ Race result recorded — thank you for improving predictions!
+              </div>
+            )}
+
             <div className="range-bar">
               <div className="range-labels">
                 <span><span className="range-tag">FAST</span> {result.low_formatted}</span>
@@ -480,35 +669,21 @@ export default function App() {
               </div>
             </div>
 
-            {/* Splits */}
-            <button
-              onClick={() => setShowSplits(!showSplits)}
-              className="btn-splits"
-            >
+            <button onClick={() => setShowSplits(!showSplits)} className="btn-splits">
               {showSplits ? 'HIDE' : 'SHOW'} SPLITS ▾
             </button>
 
             {showSplits && (
               <div className="splits-container">
                 <div className="splits-unit-row">
-                  <button
-                    onClick={() => setSplitUnit('mile')}
-                    className={`split-unit-btn ${splitUnit === 'mile' ? 'active' : ''}`}
-                  >
-                    Miles
-                  </button>
-                  <button
-                    onClick={() => setSplitUnit('km')}
-                    className={`split-unit-btn ${splitUnit === 'km' ? 'active' : ''}`}
-                  >
-                    Kilometers
-                  </button>
+                  <button onClick={() => setSplitUnit('mile')}
+                    className={`split-unit-btn ${splitUnit === 'mile' ? 'active' : ''}`}>Miles</button>
+                  <button onClick={() => setSplitUnit('km')}
+                    className={`split-unit-btn ${splitUnit === 'km' ? 'active' : ''}`}>Kilometers</button>
                 </div>
                 <div className="splits-grid">
                   <div className="splits-header">
-                    <span>Split</span>
-                    <span>Pace</span>
-                    <span>Elapsed</span>
+                    <span>Split</span><span>Pace</span><span>Elapsed</span>
                   </div>
                   {generateSplits(result.predicted_seconds, DISTANCES[goalDistIdx].km, splitUnit).map(
                     (s, i) => (
@@ -523,7 +698,6 @@ export default function App() {
               </div>
             )}
 
-            {/* Equivalent times */}
             {result.equivalents && (
               <div className="equiv-section">
                 <div className="section-label">EQUIVALENT TIMES</div>
@@ -543,9 +717,25 @@ export default function App() {
           </div>
         )}
 
+        {/* Dataset stats footer */}
+        {dataStats?.enabled && dataStats.race_results > 0 && (
+          <div className="dataset-stats">
+            <div className="section-label">COMMUNITY DATA</div>
+            <div className="dataset-numbers">
+              {dataStats.opted_in_users} contributors · {dataStats.race_results} race results
+              {dataStats.model_accuracy?.mae_seconds && (
+                <> · Model accuracy: ±{formatTime(Math.round(dataStats.model_accuracy.mae_seconds))}</>
+              )}
+            </div>
+          </div>
+        )}
+
         <footer className="footer">
           Based on the Riegel formula with adjustments for training volume, age grading, and
           experience. For best results, use a recent race time from the last 8 weeks.
+          {dataConsent && (
+            <span className="footer-data"> Your anonymized data helps improve predictions for everyone.</span>
+          )}
         </footer>
       </div>
 
@@ -582,6 +772,157 @@ export default function App() {
           color: var(--text-muted);
           margin-top: 6px;
           letter-spacing: 0.04em;
+        }
+
+        /* Consent banner */
+        .consent-banner {
+          display: flex;
+          gap: 16px;
+          background: linear-gradient(135deg, rgba(255, 107, 53, 0.08), rgba(255, 107, 53, 0.02));
+          border: 1px solid rgba(255, 107, 53, 0.25);
+          border-radius: 12px;
+          padding: 20px;
+          margin-bottom: 20px;
+        }
+        .consent-icon {
+          font-size: 28px;
+          flex-shrink: 0;
+          margin-top: 2px;
+        }
+        .consent-content { flex: 1; }
+        .consent-title {
+          font-size: 14px;
+          font-weight: 700;
+          color: var(--text);
+          margin-bottom: 6px;
+        }
+        .consent-text {
+          font-size: 12px;
+          color: var(--text-dim);
+          line-height: 1.5;
+          margin-bottom: 14px;
+        }
+        .consent-actions {
+          display: flex;
+          gap: 10px;
+        }
+        .btn-consent-yes {
+          padding: 8px 18px;
+          background: var(--accent);
+          border: none;
+          border-radius: 8px;
+          color: #fff;
+          font-family: var(--font-mono);
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .btn-consent-no {
+          padding: 8px 18px;
+          background: transparent;
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          color: var(--text-muted);
+          font-family: var(--font-mono);
+          font-size: 12px;
+          cursor: pointer;
+        }
+        .consent-badge {
+          color: #34d399;
+          font-size: 10px;
+        }
+
+        /* Contribution status */
+        .contribution-badge {
+          background: rgba(52, 211, 153, 0.08);
+          border: 1px solid rgba(52, 211, 153, 0.2);
+          border-radius: 8px;
+          padding: 10px 16px;
+          font-size: 11px;
+          color: #34d399;
+          text-align: center;
+          margin-bottom: 16px;
+        }
+
+        /* Race prompt */
+        .race-prompt {
+          background: rgba(99, 102, 241, 0.08);
+          border: 1px solid rgba(99, 102, 241, 0.25);
+          border-radius: 10px;
+          padding: 16px;
+          margin-bottom: 16px;
+          text-align: left;
+        }
+        .race-prompt-title {
+          font-size: 14px;
+          font-weight: 700;
+          color: var(--text);
+          margin-bottom: 8px;
+        }
+        .race-prompt-detail {
+          font-size: 12px;
+          color: var(--text-dim);
+          line-height: 1.5;
+          margin-bottom: 8px;
+        }
+        .race-tag {
+          display: inline-block;
+          background: rgba(255, 107, 53, 0.15);
+          color: var(--accent);
+          font-size: 9px;
+          font-weight: 700;
+          letter-spacing: 0.1em;
+          padding: 2px 6px;
+          border-radius: 4px;
+          margin-left: 8px;
+        }
+        .race-prompt-comparison {
+          font-size: 13px;
+          color: var(--text);
+          font-weight: 600;
+          margin-bottom: 12px;
+          padding: 8px 12px;
+          background: var(--surface);
+          border-radius: 6px;
+        }
+        .race-prompt-actions {
+          display: flex;
+          gap: 10px;
+        }
+        .btn-submit-race {
+          padding: 8px 18px;
+          background: #6366f1;
+          border: none;
+          border-radius: 8px;
+          color: #fff;
+          font-family: var(--font-mono);
+          font-size: 12px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .btn-dismiss-race {
+          padding: 8px 18px;
+          background: transparent;
+          border: 1px solid var(--border);
+          border-radius: 8px;
+          color: var(--text-muted);
+          font-family: var(--font-mono);
+          font-size: 12px;
+          cursor: pointer;
+        }
+
+        /* Dataset stats */
+        .dataset-stats {
+          background: var(--bg-card);
+          border: 1px solid var(--border);
+          border-radius: 12px;
+          padding: 16px 20px;
+          margin-bottom: 16px;
+          text-align: center;
+        }
+        .dataset-numbers {
+          font-size: 12px;
+          color: var(--text-dim);
         }
 
         /* Strava bar */
@@ -635,6 +976,10 @@ export default function App() {
           font-size: 11px;
           color: #fc4c02;
         }
+        .strava-actions {
+          display: flex;
+          align-items: center;
+        }
         .btn-disconnect {
           background: none;
           border: 1px solid var(--border);
@@ -645,6 +990,18 @@ export default function App() {
           padding: 6px 12px;
           cursor: pointer;
         }
+        .btn-delete-data {
+          background: none;
+          border: 1px solid var(--border);
+          border-radius: 6px;
+          font-size: 14px;
+          padding: 4px 8px;
+          cursor: pointer;
+          margin-right: 8px;
+          opacity: 0.6;
+          transition: opacity 0.2s;
+        }
+        .btn-delete-data:hover { opacity: 1; }
 
         /* Strava data */
         .strava-stats {
@@ -671,9 +1028,7 @@ export default function App() {
           letter-spacing: 0.1em;
           margin-top: 2px;
         }
-        .efforts-section {
-          margin-top: 16px;
-        }
+        .efforts-section { margin-top: 16px; }
         .efforts-grid {
           display: grid;
           grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
@@ -691,9 +1046,7 @@ export default function App() {
           transition: all 0.15s;
           color: var(--text);
         }
-        .effort-card:hover {
-          border-color: var(--accent);
-        }
+        .effort-card:hover { border-color: var(--accent); }
         .effort-active {
           border-color: var(--accent) !important;
           box-shadow: 0 0 12px var(--accent-glow);
@@ -1084,11 +1437,15 @@ export default function App() {
           max-width: 420px;
           margin: 0 auto;
         }
+        .footer-data {
+          color: #34d399;
+        }
 
         @media (max-width: 500px) {
           .big-time { font-size: 40px; }
           .equiv-grid { grid-template-columns: repeat(2, 1fr); }
           .efforts-grid { grid-template-columns: 1fr; }
+          .consent-banner { flex-direction: column; gap: 10px; }
         }
       `}</style>
     </div>
